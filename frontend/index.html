@@ -53,8 +53,12 @@ createApp({
     const user=ref(localStorage.getItem('contractlab_user')||'');
     const username=ref('admin'), password=ref('123456'), err=ref(''), tab=ref(0), actionErr=ref('');
     const contracts=ref([]), batches=ref([]), buffers=ref([]), recon=ref({});
+    const cut=ref({directory:[],visible:[],ledger:[],deviations:[],contention:[],drafts_pending:[],revision:0});
     const form=ref({subject:'订单入站', payload_fields:'order_id,amount'});
-    const nav=['契约版本','入站校验','双写缓冲','契约对账'];
+    const cutForm=ref({subject:'订单入站', action:'摘流', path:'甲'});
+    const cutPolicy=ref({policy:{},subjects:[],revision:0});
+    const cutMsg=ref('');
+    const nav=['契约版本','入站校验','双写缓冲','摘流切换','契约对账'];
     function auth(){return {Authorization:'Bearer '+token.value,'Content-Type':'application/json'};}
     async function login(){
       err.value='';
@@ -81,6 +85,29 @@ createApp({
       buffers.value=Array.isArray(u.items)?u.items:[];
       const q=await loadJson('/api/reconcile'); if(q===null) return;
       recon.value=q&&typeof q==='object'?q:{};
+      const k=await loadJson('/api/cutoff'); if(k===null) return;
+      cut.value=k&&typeof k==='object'?Object.assign({directory:[],visible:[],ledger:[],deviations:[],contention:[],drafts_pending:[],revision:0},k):cut.value;
+      const p=await loadJson('/api/cutoff/policy');
+      if(p&&typeof p==='object') cutPolicy.value=Object.assign({policy:{},subjects:[],revision:0},p);
+      const subjects=(cut.value.directory||[]).map(d=>d.subject);
+      if(!subjects.includes(cutForm.value.subject)) cutForm.value.subject=subjects[0]||cutForm.value.subject;
+    }
+    async function cutSwitch(){
+      cutMsg.value='';
+      const r=await fetch('/api/cutoff/switch',{method:'POST',headers:auth(),body:JSON.stringify({
+        subject:cutForm.value.subject, action:cutForm.value.action, path:cutForm.value.path,
+        expected_revision:cut.value.revision})});
+      const j=await r.json().catch(()=>({}));
+      cutMsg.value=r.ok?(j.state==='草稿'?('已落摘流切换簿草稿 #'+j.draft_id+'，确认前仍按旧可见清单裁决'):('已原子切换正式，revision '+j.revision)):(j.detail||'失败');
+      await refresh();
+    }
+    async function cutCommit(id){
+      cutMsg.value='';
+      const r=await fetch('/api/cutoff/commit',{method:'POST',headers:auth(),body:JSON.stringify({
+        draft_id:id, expected_revision:cut.value.revision})});
+      const j=await r.json().catch(()=>({}));
+      cutMsg.value=r.ok?('草稿 #'+id+' 已一次切到正式可见集'):(j.detail||'失败');
+      await refresh();
     }
     async function validate(){
       actionErr.value='';
@@ -89,7 +116,7 @@ createApp({
       await refresh();
     }
     onMounted(()=>{if(token.value)refresh();});
-    return {token,user,username,password,err,tab,nav,contracts,batches,buffers,recon,form,actionErr,login,logout,validate};
+    return {token,user,username,password,err,tab,nav,contracts,batches,buffers,recon,form,actionErr,login,logout,validate,cut,cutForm,cutPolicy,cutMsg,cutSwitch,cutCommit};
   },
   template:`
   <div v-if="!token" class="login">
@@ -114,8 +141,7 @@ createApp({
         <td>{{c.version}}</td><td>{{c.subject}}</td><td>{{c.mode}} / {{c.track}}</td><td>{{c.status}}</td><td>{{c.required_fields}}</td>
       </tr></tbody></table>
     </div>
-    <div class="pair" v-show="tab===1">
-      <div class="card">
+    <div class="pair" v-show="tab===1">      <div class="card">
         <h2>提交入站</h2>
         <label>主题</label><input v-model="form.subject"/>
         <label>载荷字段</label><input v-model="form.payload_fields"/>
@@ -138,8 +164,59 @@ createApp({
       <tbody><tr v-for="b in buffers" :key="b.id"><td>{{b.id}}</td><td>{{b.batch_id}}</td><td>{{b.subject}}</td><td>{{b.reason}}</td></tr></tbody></table>
     </div>
     <div class="card" v-show="tab===3">
+      <h2>摘流切换簿</h2>
+      <p class="meta">当前 revision {{cut.revision}} · 摘流生效 {{(cut.directory||[]).filter(d=>d.cut===1).length}} · 可见集 {{(cut.visible||[]).length}} 项 · 待确认草稿 {{(cut.drafts_pending||[]).length}}</p>
+      <div class="pair">
+        <div>
+          <label>主题</label><input v-model="cutForm.subject"/>
+          <label>动作</label><input v-model="cutForm.action" placeholder="摘流 / 解除"/>
+          <label>路径（甲=同事务，乙=草稿确认后原子切）</label><input v-model="cutForm.path"/>
+          <button class="primary" @click="cutSwitch">写入摘流切换簿</button>
+          <div class="err">{{cutMsg}}</div>
+          <p class="meta">同日选定路径后不许更换；偏离切换簿一律拒绝并记“摘流偏了”。两值班抢改排队，后到只记摘流争用。</p>
+        </div>
+        <div>
+          <h2 style="font-size:18px">摘流目录 / 可见集</h2>
+          <table><thead><tr><th>主题</th><th>摘流</th><th>路径</th><th>可见</th></tr></thead>
+          <tbody><tr v-for="d in (cut.directory||[])" :key="d.subject">
+            <td>{{d.subject}}</td><td>{{d.cut?'已摘':'未摘'}}</td><td>{{d.path||'—'}}</td>
+            <td><span class="stamp" :class="{bad:d.cut===1}">{{(cut.visible||[]).some(v=>v.subject===d.subject)?'纳入':'不可见'}}</span></td>
+          </tr></tbody></table>
+        </div>
+      </div>
+      <h2 style="font-size:18px;margin-top:14px">待确认草稿</h2>
+      <table><thead><tr><th>簿号</th><th>主题</th><th>动作/路径</th><th>操作</th></tr></thead>
+      <tbody><tr v-for="d in (cut.drafts_pending||[])" :key="d.id">
+        <td>#{{d.id}}</td><td>{{d.subject}}</td><td>{{d.action}} / {{d.path}}</td>
+        <td><button class="ghost" @click="cutCommit(d.id)">确认一次切正式</button></td>
+      </tr></tbody></table>
+      <h2 style="font-size:18px;margin-top:14px">摘流切换簿 / 偏离记录</h2>
+      <table><thead><tr><th>簿号</th><th>主题</th><th>动作/路径</th><th>状态</th><th>值班</th></tr></thead>
+      <tbody><tr v-for="l in (cut.ledger||[])" :key="l.id">
+        <td>#{{l.id}}</td><td>{{l.subject}}</td><td>{{l.action}} / {{l.path}}</td><td>{{l.state}}</td><td>{{l.operator}}</td>
+      </tr></tbody></table>
+      <p class="meta">摘流偏了 {{(cut.deviations||[]).length}} · 摘流争用 {{(cut.contention||[]).length}}</p>
+      <table><thead><tr><th>类型</th><th>主题</th><th>说明</th></tr></thead>
+      <tbody><tr v-for="d in (cut.deviations||[]).slice(0,6)" :key="d.id"><td>{{d.kind}}</td><td>{{d.subject}}</td><td>{{d.detail}}</td></tr></tbody></table>
+      <table><thead><tr><th>争用</th><th>主题</th><th>说明</th></tr></thead>
+      <tbody><tr v-for="d in (cut.contention||[]).slice(0,6)" :key="d.id"><td>#{{d.id}}</td><td>{{d.subject}}</td><td>{{d.detail}}</td></tr></tbody></table>
+      <h2 style="font-size:18px;margin-top:14px">策略附页</h2>
+      <table><thead><tr><th>项</th><th>口径</th></tr></thead>
+      <tbody>
+        <tr><td>已摘流</td><td>{{cutPolicy.policy.cut}}</td></tr>
+        <tr><td>可见集</td><td>{{cutPolicy.policy.visible}}</td></tr>
+        <tr><td>甲路径</td><td>{{cutPolicy.policy.path_a}}</td></tr>
+        <tr><td>乙路径</td><td>{{cutPolicy.policy.path_b}}</td></tr>
+        <tr><td>同日路径</td><td>{{cutPolicy.policy.same_day}}</td></tr>
+        <tr><td>抢改</td><td>{{cutPolicy.policy.contention}}</td></tr>
+      </tbody></table>
+      <p class="meta">策略附页 revision {{cutPolicy.revision}} · 覆盖主题 {{(cutPolicy.subjects||[]).join('、')}}</p>
+    </div>
+    <div class="card" v-show="tab===4">
       <h2>契约对账摘要</h2>
       <p>入站 {{recon.ingress_total}} · 通过 {{recon.passed}} · 缓冲 {{recon.buffered}} · 拒收 {{recon.rejected}} · 缓冲行 {{recon.buffer_rows}} · 对齐 {{recon.aligned}}</p>
+      <p>摘流生效 {{recon.cutoff_active}} · 目录 {{recon.cutoff_directory_rows}} · 可见集 {{recon.visible_subjects}} · 摘流可见集对齐 {{recon.cutoff_visible_aligned}} · 待确认草稿 {{recon.cutoff_drafts_pending}}</p>
+      <p>摘流偏了 {{recon.cutoff_deviations}} · 摘流争用 {{recon.cutoff_contention}}</p>
     </div>
   </div>`
 }).mount('#app');
